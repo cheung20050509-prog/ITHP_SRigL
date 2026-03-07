@@ -241,6 +241,9 @@ class NeuroplasticScheduler:
             # Activity tracking
             'ema_alpha': 0.1,
             
+            # Warmup - train this many steps before any topology changes
+            'warmup_steps': 500,
+            
             # Pruning
             'prune_interval': 200,
             'prune_threshold': 0.001,
@@ -473,6 +476,13 @@ class NeuroplasticScheduler:
         if loss is not None:
             self.stability_guard.update(loss, ib_loss)
         
+        # Warmup: skip topology changes during initial training
+        warmup_steps = self.config.get('warmup_steps', 500)
+        if self.step_count <= warmup_steps:
+            if self.step_count == warmup_steps:
+                print(f"[Neuroplastic] Warmup complete at step {warmup_steps}, starting topology updates")
+            return
+        
         # Check if safe to modify
         if not self.stability_guard.can_modify_topology():
             if self.stability_guard.freeze_reason:
@@ -480,12 +490,13 @@ class NeuroplasticScheduler:
                     print(f"[Neuroplastic] Topology frozen: {self.stability_guard.freeze_reason}")
             return
             
-        # Prune at intervals
-        if self.step_count % self.config['prune_interval'] == 0:
+        # Prune at intervals (offset by warmup)
+        effective_step = self.step_count - warmup_steps
+        if effective_step % self.config['prune_interval'] == 0:
             self._prune_inactive()
             
-        # Grow at intervals
-        if self.step_count % self.config['growth_interval'] == 0:
+        # Grow at intervals (offset by warmup)
+        if effective_step % self.config['growth_interval'] == 0:
             self._grow_hebbian()
             
     def get_stats(self) -> Dict:

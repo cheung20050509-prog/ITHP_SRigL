@@ -232,7 +232,7 @@ class ITHP_DebertaModel_Neuroplastic(DebertaV2PreTrainedModel):
             nn.Linear(multimodal_config.B1_dim, TEXT_DIM),
         )
         self.LayerNorm = nn.LayerNorm(config.hidden_size)
-        self.dropout = nn.Dropout(multimodal_config.dropout_prob)
+        self.dropout = nn.Dropout(multimodal_config.drop_prob)
         self.init_weights()
         self.beta_shift = multimodal_config.beta_shift
 

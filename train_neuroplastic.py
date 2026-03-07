@@ -59,6 +59,7 @@ def get_args():
     parser.add_argument('--B1_dim', default=64, type=int)
     
     # Neuroplastic args
+    parser.add_argument("--warmup_steps", type=int, default=500, help="Steps before topology changes start")
     parser.add_argument("--prune_interval", type=int, default=200)
     parser.add_argument("--growth_interval", type=int, default=200)
     parser.add_argument("--prune_threshold", type=float, default=0.001)
@@ -206,6 +207,7 @@ def prep_for_training(args, num_train_steps):
     np_scheduler = None
     if not args.no_neuroplastic:
         np_config = {
+            'warmup_steps': args.warmup_steps,
             'prune_interval': args.prune_interval,
             'growth_interval': args.growth_interval,
             'prune_threshold': args.prune_threshold,
@@ -231,9 +233,10 @@ def train_epoch(model, train_loader, optimizer, scheduler, np_scheduler, args):
         input_ids, visual, acoustic, label_ids = batch
         visual = torch.mean(visual, dim=1)
         acoustic = torch.mean(acoustic, dim=1)
+        label_ids = label_ids.view(-1)  # Flatten to 1D, safe for batch_size=1
         
         logits, IB_total = model(input_ids, visual, acoustic)
-        logits = logits.squeeze(-1)
+        logits = logits.view(-1)  # Flatten to 1D
         
         loss_fct = MSELoss()
         mse_loss = loss_fct(logits, label_ids)
@@ -289,25 +292,30 @@ def evaluate(model, data_loader):
     labels = labels[valid_mask]
     
     if len(preds) == 0:
-        return {'acc': 0, 'f1': 0, 'mae': float('inf'), 'corr': 0}
+        return {'acc2': 0, 'acc7': 0, 'f1': 0, 'mae': float('inf'), 'corr': 0}
     
-    # Binary accuracy (exclude zero sentiment)
+    # Acc-2: Binary accuracy (exclude zero sentiment)
     non_zero_mask = labels != 0
     if non_zero_mask.sum() > 0:
         preds_nz = preds[non_zero_mask]
         labels_nz = labels[non_zero_mask]
         preds_binary = (preds_nz > 0).astype(int)
         labels_binary = (labels_nz > 0).astype(int)
-        acc = accuracy_score(labels_binary, preds_binary)
+        acc2 = accuracy_score(labels_binary, preds_binary)
         f1 = f1_score(labels_binary, preds_binary, average='weighted')
     else:
-        acc, f1 = 0.5, 0.5
+        acc2, f1 = 0.5, 0.5
+    
+    # Acc-7: 7-class accuracy (round to nearest integer in [-3, 3])
+    preds_7 = np.clip(np.round(preds), -3, 3).astype(int)
+    labels_7 = np.clip(np.round(labels), -3, 3).astype(int)
+    acc7 = accuracy_score(labels_7, preds_7)
     
     # MAE and correlation
     mae = np.mean(np.abs(preds - labels))
     corr = np.corrcoef(preds, labels)[0, 1] if len(preds) > 1 else 0
     
-    return {'acc': acc, 'f1': f1, 'mae': mae, 'corr': corr}
+    return {'acc2': acc2, 'acc7': acc7, 'f1': f1, 'mae': mae, 'corr': corr}
 
 
 def main():
@@ -358,23 +366,23 @@ def main():
         train_loss = train_epoch(model, train_loader, optimizer, scheduler, np_scheduler, args)
         
         dev_metrics = evaluate(model, dev_loader)
-        print(f"Dev: Acc={dev_metrics['acc']:.4f}, F1={dev_metrics['f1']:.4f}, "
+        print(f"Dev: Acc2={dev_metrics['acc2']:.4f}, Acc7={dev_metrics['acc7']:.4f}, F1={dev_metrics['f1']:.4f}, "
               f"MAE={dev_metrics['mae']:.4f}, Corr={dev_metrics['corr']:.4f}")
         
         # Print neuroplastic stats
         if np_scheduler is not None:
             np_scheduler.print_stats()
         
-        # Save best model
-        if dev_metrics['acc'] > best_acc:
-            best_acc = dev_metrics['acc']
+        # Save best model (based on Acc2)
+        if dev_metrics['acc2'] > best_acc:
+            best_acc = dev_metrics['acc2']
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'best_acc': best_acc,
             }, os.path.join(args.output_dir, 'best_model.pt'))
-            print(f"  -> Saved best model (acc={best_acc:.4f})")
+            print(f"  -> Saved best model (acc2={best_acc:.4f})")
         
         # Periodic save
         if epoch % args.save_every == 0:
@@ -393,7 +401,7 @@ def main():
     model.load_state_dict(ckpt['model_state_dict'])
     
     test_metrics = evaluate(model, test_loader)
-    print(f"Test: Acc={test_metrics['acc']:.4f}, F1={test_metrics['f1']:.4f}, "
+    print(f"Test: Acc2={test_metrics['acc2']:.4f}, Acc7={test_metrics['acc7']:.4f}, F1={test_metrics['f1']:.4f}, "
           f"MAE={test_metrics['mae']:.4f}, Corr={test_metrics['corr']:.4f}")
     
     if np_scheduler is not None:
