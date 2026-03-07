@@ -50,6 +50,7 @@ def get_args():
     # Model args (must match training)
     parser.add_argument('--inter_dim', default=256, type=int)
     parser.add_argument("--drop_prob", default=0.3, type=float)
+    parser.add_argument("--dropout_prob", default=0.1, type=float)
     parser.add_argument('--p_lambda', default=0.3, type=float)
     parser.add_argument('--p_beta', default=8, type=float)
     parser.add_argument('--p_gamma', default=32, type=float)
@@ -206,9 +207,9 @@ def test_epoch(model, test_dataloader):
             batch = tuple(t.to(DEVICE) for t in batch)
 
             input_ids, visual, acoustic, label_ids = batch
-            # Use mean like train_neuroplastic.py (not squeeze like original ITHP)
-            visual = torch.mean(visual, dim=1)
-            acoustic = torch.mean(acoustic, dim=1)
+            # Use squeeze like train_neuroplastic.py (keep sequence dimension)
+            visual = torch.squeeze(visual, 1)
+            acoustic = torch.squeeze(acoustic, 1)
 
             # Normalize like original ITHP
             visual_norm = (visual - visual.min()) / (visual.max() - visual.min() + 1e-8)
@@ -252,14 +253,19 @@ def test_score_model(model, test_dataloader, use_zero=False):
     mae = np.mean(np.absolute(preds_nz - y_test_nz))
     corr = np.corrcoef(preds_nz, y_test_nz)[0][1]
 
-    # Binary classification (positive/negative)
+    # Binary classification (positive/negative) - ACC2
     preds_binary = preds_nz >= 0
     y_test_binary = y_test_nz >= 0
 
     f_score = f1_score(y_test_binary, preds_binary, average="weighted")
-    acc = accuracy_score(y_test_binary, preds_binary)
+    acc2 = accuracy_score(y_test_binary, preds_binary)
+    
+    # 7-class accuracy - ACC7 (round to nearest integer in [-3, 3])
+    preds_7 = np.clip(np.round(preds), -3, 3).astype(int)
+    labels_7 = np.clip(np.round(y_test), -3, 3).astype(int)
+    acc7 = accuracy_score(labels_7, preds_7)
 
-    return acc, mae, corr, f_score
+    return acc2, acc7, mae, corr, f_score
 
 
 def count_connections(model):
@@ -306,13 +312,17 @@ def main():
     config = DebertaV2Config.from_pretrained(args.model)
     config.num_labels = 1  # Regression task
     model = ITHP_DeBertaForSequenceClassification_Neuroplastic(
-        config, args, enable_skip=True
+        config, args
     ).to(DEVICE)
     
     # Load checkpoint
     print(f"Loading checkpoint: {args.checkpoint}")
     ckpt = torch.load(args.checkpoint, map_location=DEVICE)
-    model.load_state_dict(ckpt['model_state_dict'])
+    # Filter out cache buffers that may have different shapes (they're only for training)
+    state_dict = ckpt['model_state_dict']
+    filtered_state_dict = {k: v for k, v in state_dict.items() 
+                          if 'input_cache' not in k and 'output_cache' not in k}
+    model.load_state_dict(filtered_state_dict, strict=False)
     print(f"  Loaded from epoch {ckpt.get('epoch', 'N/A')}")
     if 'best_acc' in ckpt:
         print(f"  Best validation acc: {ckpt['best_acc']:.4f}")
@@ -327,12 +337,13 @@ def main():
     
     # Test
     print("\nRunning test evaluation...")
-    acc, mae, corr, f_score = test_score_model(model, test_loader)
+    acc2, acc7, mae, corr, f_score = test_score_model(model, test_loader)
     
     print("\n" + "=" * 60)
     print("TEST RESULTS (Original ITHP Methodology)")
     print("=" * 60)
-    print(f"  Accuracy (Acc-2): {acc*100:.2f}%")
+    print(f"  Accuracy (Acc-2): {acc2*100:.2f}%")
+    print(f"  Accuracy (Acc-7): {acc7*100:.2f}%")
     print(f"  MAE:              {mae:.4f}")
     print(f"  Correlation:      {corr:.4f}")
     print(f"  F1 Score:         {f_score:.4f}")
@@ -343,7 +354,8 @@ def main():
     print("-" * 50)
     print(f"| Metric      | Neuroplastic | Original ITHP |")
     print(f"|-------------|--------------|---------------|")
-    print(f"| Accuracy    | {acc*100:.2f}%       | 84.27%        |")
+    print(f"| Acc-2       | {acc2*100:.2f}%       | 84.27%        |")
+    print(f"| Acc-7       | {acc7*100:.2f}%       | 46.49%        |")
     print(f"| MAE         | {mae:.4f}       | 0.8049        |")
     print(f"| Correlation | {corr:.4f}       | 0.8117        |")
     print(f"| F1 Score    | {f_score:.4f}       | 0.8432        |")
@@ -352,7 +364,8 @@ def main():
     
     # Save results
     results = {
-        'accuracy': acc,
+        'acc2': acc2,
+        'acc7': acc7,
         'mae': mae,
         'correlation': corr,
         'f1_score': f_score,

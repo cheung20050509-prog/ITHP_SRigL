@@ -64,11 +64,13 @@ def get_args():
     parser.add_argument("--growth_interval", type=int, default=200)
     parser.add_argument("--prune_threshold", type=float, default=0.001)
     parser.add_argument("--max_density", type=float, default=1.5)
-    parser.add_argument("--enable_skip", action="store_true", default=True)
+    parser.add_argument("--max_prune_ratio", type=float, default=0.05, help="Max fraction to prune per update")
+    parser.add_argument("--growth_ratio", type=float, default=0.05, help="Max fraction to grow per update")
     parser.add_argument("--no_neuroplastic", action="store_true", default=False)
     
     # Checkpoint args
     parser.add_argument("--output_dir", type=str, default="./neuroplastic_checkpoints")
+    parser.add_argument("--checkpoint_dir", type=str, default=None, help="Override output_dir")
     parser.add_argument("--save_every", type=int, default=5)
     
     return parser.parse_args()
@@ -191,9 +193,7 @@ def prep_for_training(args, num_train_steps):
     config = DebertaV2Config.from_pretrained(args.model)
     config.num_labels = 1
     
-    model = ITHP_DeBertaForSequenceClassification_Neuroplastic(
-        config, args, enable_skip=args.enable_skip
-    )
+    model = ITHP_DeBertaForSequenceClassification_Neuroplastic(config, args)
     model = model.to(DEVICE)
     
     optimizer = AdamW(model.parameters(), lr=args.learning_rate)
@@ -212,6 +212,8 @@ def prep_for_training(args, num_train_steps):
             'growth_interval': args.growth_interval,
             'prune_threshold': args.prune_threshold,
             'max_density': args.max_density,
+            'max_prune_ratio': args.max_prune_ratio,
+            'growth_ratio': args.growth_ratio,
         }
         np_scheduler = NeuroplasticScheduler(
             model, optimizer, num_train_steps, np_config
@@ -225,18 +227,24 @@ def train_epoch(model, train_loader, optimizer, scheduler, np_scheduler, args):
     tr_loss = 0
     ib_loss_total = 0
     n_batches = 0
+    total_batches = len(train_loader)
     
-    pbar = tqdm(train_loader, desc="Training")
-    
-    for batch in pbar:
+    for batch_idx, batch in enumerate(train_loader):
+        batch = tuple(t.to(DEVICE) for t in batch)
         batch = tuple(t.to(DEVICE) for t in batch)
         input_ids, visual, acoustic, label_ids = batch
-        visual = torch.mean(visual, dim=1)
-        acoustic = torch.mean(acoustic, dim=1)
-        label_ids = label_ids.view(-1)  # Flatten to 1D, safe for batch_size=1
         
-        logits, IB_total = model(input_ids, visual, acoustic)
+        # Match original preprocessing
+        visual = torch.squeeze(visual, 1)
+        acoustic = torch.squeeze(acoustic, 1)
+        
+        # Normalize (match original)
+        visual_norm = (visual - visual.min()) / (visual.max() - visual.min() + 1e-8)
+        acoustic_norm = (acoustic - acoustic.min()) / (acoustic.max() - acoustic.min() + 1e-8)
+        
+        logits, IB_total = model(input_ids, visual_norm, acoustic_norm)
         logits = logits.view(-1)  # Flatten to 1D
+        label_ids = label_ids.view(-1)
         
         loss_fct = MSELoss()
         mse_loss = loss_fct(logits, label_ids)
@@ -258,10 +266,9 @@ def train_epoch(model, train_loader, optimizer, scheduler, np_scheduler, args):
         ib_loss_total += IB_total.item()
         n_batches += 1
         
-        pbar.set_postfix({
-            'loss': f'{tr_loss/n_batches:.4f}',
-            'IB': f'{ib_loss_total/n_batches:.4f}'
-        })
+        # Print progress every 20 batches (flush immediately)
+        if n_batches % 20 == 0 or n_batches == total_batches:
+            print(f"  [{n_batches}/{total_batches}] loss={tr_loss/n_batches:.4f}, IB={ib_loss_total/n_batches:.4f}", flush=True)
     
     return tr_loss / n_batches
 
@@ -274,10 +281,16 @@ def evaluate(model, data_loader):
     for batch in data_loader:
         batch = tuple(t.to(DEVICE) for t in batch)
         input_ids, visual, acoustic, label_ids = batch
-        visual = torch.mean(visual, dim=1)
-        acoustic = torch.mean(acoustic, dim=1)
         
-        logits, _ = model(input_ids, visual, acoustic)
+        # Match original preprocessing
+        visual = torch.squeeze(visual, 1)
+        acoustic = torch.squeeze(acoustic, 1)
+        
+        # Normalize (match original)
+        visual_norm = (visual - visual.min()) / (visual.max() - visual.min() + 1e-8)
+        acoustic_norm = (acoustic - acoustic.min()) / (acoustic.max() - acoustic.min() + 1e-8)
+        
+        logits, _ = model(input_ids, visual_norm, acoustic_norm)
         logits = logits.squeeze(-1)
         
         preds.extend(logits.cpu().numpy().flatten())
@@ -338,7 +351,9 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
     
-    # Create output dir
+    # Create output dir (allow override)
+    if args.checkpoint_dir:
+        args.output_dir = args.checkpoint_dir
     os.makedirs(args.output_dir, exist_ok=True)
     
     # Load data
@@ -355,7 +370,7 @@ def main():
     print(f"Dataset: {args.dataset}")
     print(f"Epochs: {args.n_epochs}")
     print(f"Neuroplastic: {'Enabled' if np_scheduler else 'Disabled'}")
-    print(f"Skip connections: {args.enable_skip}")
+    print(f"Synaptic targets: ITHP + DeBERTa FFN")
     print("=" * 60)
     
     best_acc = 0

@@ -7,7 +7,7 @@ conda activate ITHP
 
 mkdir -p ITHP_SRigL/logs
 
-CUDA_VISIBLE_DEVICES=1 nohup python ITHP_SRigL/train_neuroplastic.py \
+CUDA_VISIBLE_DEVICES=1 nohup python -u ITHP_SRigL/train_neuroplastic.py \
     --dataset mosi \
     --n_epochs 30 \
     --train_batch_size 8 \
