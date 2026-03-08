@@ -18,6 +18,13 @@ import torch.nn.functional as F
 from transformers.models.deberta_v2.modeling_deberta_v2 import DebertaV2PreTrainedModel, DebertaV2Model
 from transformers.models.bert.modeling_bert import BertPooler
 import global_configs
+
+# Graph fusion imports (optional)
+try:
+    from graph_modules import SmallWorldScaleFreeGraphFusion
+    GRAPH_FUSION_AVAILABLE = True
+except ImportError:
+    GRAPH_FUSION_AVAILABLE = False
 from global_configs import DEVICE
 
 from typing import List, Tuple, Dict, Optional
@@ -339,8 +346,10 @@ class ITHP_Neuroplastic(nn.Module):
 class ITHP_DebertaModel_Neuroplastic(nn.Module):
     """DeBERTa + ITHP with true synaptic plasticity.
     
-    Structure (matches original ITHP exactly):
+    Structure (with optional graph fusion):
         input_ids -> DeBERTa -> x (batch, seq, 768)
+                                ↓
+                     [GraphFusion] (optional: Small-World + Scale-Free)
                                 ↓
                             ITHP -> b1 (batch, seq, B1_dim)
                                 ↓
@@ -359,6 +368,38 @@ class ITHP_DebertaModel_Neuroplastic(nn.Module):
         
         self.text_encoder = DebertaV2Model.from_pretrained("microsoft/deberta-v3-base")
         self.text_encoder.config = config
+        
+        # Graph fusion (Small-World + Scale-Free topology)
+        self.use_graph_fusion = getattr(args, 'use_graph_fusion', False) and GRAPH_FUSION_AVAILABLE
+        if self.use_graph_fusion:
+            n_visual_seg = getattr(args, 'n_visual_segments', 8)
+            n_acoustic_seg = getattr(args, 'n_acoustic_segments', 8)
+            graph_hidden = getattr(args, 'graph_hidden_dim', 256)
+            
+            self.graph_fusion = SmallWorldScaleFreeGraphFusion(
+                text_dim=TEXT_DIM,
+                visual_dim=VISUAL_DIM,
+                acoustic_dim=ACOUSTIC_DIM,
+                hidden_dim=graph_hidden,
+                n_text_nodes=args.max_seq_length,
+                n_visual_segments=n_visual_seg,
+                n_acoustic_segments=n_acoustic_seg,
+                n_heads=getattr(args, 'graph_n_heads', 4),
+                n_layers=getattr(args, 'graph_n_layers', 2),
+                dropout=args.drop_prob,
+                sw_k=getattr(args, 'sw_k', 6),
+                sw_p=getattr(args, 'sw_p', 0.15),
+                sf_m=getattr(args, 'sf_m', 3),
+                topology_alpha=getattr(args, 'topology_alpha', 0.5),
+                learnable_topology=getattr(args, 'learnable_topology', True),
+                cross_modal_connectivity=getattr(args, 'cross_modal_connectivity', 0.3),
+            )
+            n_total = args.max_seq_length + n_visual_seg + n_acoustic_seg
+            print(f"[GraphFusion] Enabled: {n_total} nodes (text={args.max_seq_length}, visual={n_visual_seg}, acoustic={n_acoustic_seg})")
+            print(f"  Small-World(k={getattr(args, 'sw_k', 6)}, p={getattr(args, 'sw_p', 0.15)}) + "
+                  f"Scale-Free(m={getattr(args, 'sf_m', 3)}), alpha={getattr(args, 'topology_alpha', 0.5)}")
+        else:
+            self.graph_fusion = None
         
         ITHP_args = {
             'X0_dim': TEXT_DIM,  # 768
@@ -395,6 +436,11 @@ class ITHP_DebertaModel_Neuroplastic(nn.Module):
         embedding_output = self.text_encoder(input_ids)
         x = embedding_output[0]
         
+        # Graph fusion (if enabled)
+        topology_loss = torch.tensor(0.0, device=x.device)
+        if self.graph_fusion is not None:
+            x, visual, acoustic, topology_loss = self.graph_fusion(x, visual, acoustic)
+        
         # ITHP: process full sequence, outputs b1 (batch, seq, B1_dim)
         b1, IB_total, kl_loss_0, mse_0, kl_loss_1, mse_1 = self.ithp(x, visual, acoustic)
         
@@ -410,7 +456,7 @@ class ITHP_DebertaModel_Neuroplastic(nn.Module):
         # Pool to get sentence representation
         pooled_output = self.pooler(sequence_output)  # (batch, 768)
         
-        return pooled_output, IB_total, kl_loss_0, mse_0, kl_loss_1, mse_1
+        return pooled_output, IB_total, topology_loss, kl_loss_0, mse_0, kl_loss_1, mse_1
     
     def get_all_neuroplastic_blocks(self) -> List[NeuroplasticBlock]:
         """Return all NeuroplasticBlocks for scheduler management."""
@@ -441,7 +487,7 @@ class ITHP_DeBertaForSequenceClassification_Neuroplastic(nn.Module):
         visual,
         acoustic,
     ):
-        pooled_output, IB_total, kl_loss_0, mse_0, kl_loss_1, mse_1 = self.deberta_ithp(
+        pooled_output, IB_total, topology_loss, kl_loss_0, mse_0, kl_loss_1, mse_1 = self.deberta_ithp(
             input_ids,
             visual,
             acoustic,
@@ -450,7 +496,7 @@ class ITHP_DeBertaForSequenceClassification_Neuroplastic(nn.Module):
         pooled_output = self.dropout(pooled_output)
         logits = self.classifier(pooled_output)
         
-        return logits, IB_total
+        return logits, IB_total, topology_loss
     
     def get_all_neuroplastic_blocks(self) -> List[NeuroplasticBlock]:
         """Return all NeuroplasticBlocks for scheduler management."""

@@ -16,6 +16,14 @@ from collections import defaultdict
 import math
 import numpy as np
 
+# 统一的神经元级拓扑管理
+try:
+    from .neuron_topology import NeuronLevelTopology
+    from .global_neuron_graph import GlobalNeuronGraph
+except ImportError:
+    from neuron_topology import NeuronLevelTopology
+    from global_neuron_graph import GlobalNeuronGraph
+
 
 class ActivityTracker:
     """Track connection activity using EMA of |weight| × |input| × |gradient|"""
@@ -123,6 +131,129 @@ class HebbianTracker:
         self.sample_count.clear()
 
 
+class ContinuousScalePolicy:
+    """
+    连续动作空间的强化学习策略，用于学习最优scale。
+    
+    比离散UCB更精细，使用高斯策略 + 自然策略梯度：
+    - 动作: scale ~ N(μ, σ²)，clamp到有效范围
+    - 状态: 当前loss, loss变化率, 稀疏度等
+    - 奖励: loss下降 + 稀疏度维持
+    
+    使用REINFORCE with baseline进行策略更新。
+    """
+    
+    def __init__(
+        self, 
+        name: str = "weight",  # "weight" or "graph"
+        init_mean: float = 0.05,
+        init_std: float = 0.02,
+        min_scale: float = 0.005,
+        max_scale: float = 0.15,
+        lr_mean: float = 0.01,
+        lr_std: float = 0.005,
+        baseline_ema: float = 0.9,
+    ):
+        self.name = name
+        
+        # 策略参数: scale ~ N(μ, σ²)
+        self.mean = init_mean
+        self.std = init_std
+        self.min_scale = min_scale
+        self.max_scale = max_scale
+        
+        # 学习率
+        self.lr_mean = lr_mean
+        self.lr_std = lr_std
+        
+        # Baseline for variance reduction (EMA of rewards)
+        self.baseline = 0.0
+        self.baseline_ema = baseline_ema
+        
+        # 历史记录
+        self.history = []  # [(scale, reward), ...]
+        self.current_scale = None
+        self.pre_update_loss = None
+        
+        # 统计
+        self.total_updates = 0
+        self.cumulative_reward = 0.0
+        
+    def sample_scale(self) -> float:
+        """采样scale从当前策略分布"""
+        # 从高斯分布采样
+        scale = np.random.normal(self.mean, self.std)
+        # Clamp到有效范围
+        scale = np.clip(scale, self.min_scale, self.max_scale)
+        self.current_scale = scale
+        return scale
+    
+    def begin_update(self, current_loss: float):
+        """记录更新前的loss"""
+        self.pre_update_loss = current_loss
+        
+    def end_update(self, post_loss: float, sparsity_penalty: float = 0.0):
+        """
+        更新完成后计算reward并更新策略。
+        
+        Args:
+            post_loss: 更新后的loss
+            sparsity_penalty: 稀疏度惩罚（如果稀疏度偏离目标）
+        """
+        if self.pre_update_loss is None or self.current_scale is None:
+            return
+            
+        # 计算reward: loss下降 - 稀疏度惩罚
+        reward = (self.pre_update_loss - post_loss) - 0.1 * sparsity_penalty
+        
+        # 更新baseline (EMA)
+        self.baseline = self.baseline_ema * self.baseline + (1 - self.baseline_ema) * reward
+        
+        # Advantage = reward - baseline
+        advantage = reward - self.baseline
+        
+        # ============ 策略梯度更新 ============
+        # REINFORCE: ∇J = E[∇log π(a|s) × A]
+        # 对于高斯策略 π(a) = N(μ, σ²):
+        #   ∇_μ log π = (a - μ) / σ²
+        #   ∇_σ log π = ((a - μ)² - σ²) / σ³
+        
+        a = self.current_scale
+        
+        # 梯度计算
+        grad_mean = (a - self.mean) / (self.std ** 2)
+        grad_std = ((a - self.mean) ** 2 - self.std ** 2) / (self.std ** 3)
+        
+        # 策略更新
+        self.mean += self.lr_mean * advantage * grad_mean
+        self.std += self.lr_std * advantage * grad_std
+        
+        # 约束
+        self.mean = np.clip(self.mean, self.min_scale, self.max_scale)
+        self.std = np.clip(self.std, 0.005, 0.05)  # 不要太确定也不要太随机
+        
+        # 记录
+        self.history.append((self.current_scale, reward))
+        self.total_updates += 1
+        self.cumulative_reward += reward
+        
+        self.pre_update_loss = None
+        
+    def get_stats(self) -> Dict:
+        """获取策略统计信息"""
+        recent_rewards = [r for _, r in self.history[-10:]] if self.history else []
+        return {
+            'name': self.name,
+            'mean': float(self.mean),
+            'std': float(self.std),
+            'baseline': float(self.baseline),
+            'total_updates': self.total_updates,
+            'avg_reward': float(self.cumulative_reward / max(1, self.total_updates)),
+            'recent_avg_reward': float(np.mean(recent_rewards)) if recent_rewards else 0.0,
+            'last_scale': float(self.current_scale) if self.current_scale else None,
+        }
+
+
 class AdaptiveUpdatePolicy:
     """UCB-based policy for selecting topology update magnitude.
     
@@ -198,19 +329,24 @@ class StabilityGuard:
     
     Key insight: 拓扑更新应该在权重稳定后进行，而不是固定间隔。
     训练过程：训练 -> 稳定 -> 更新拓扑 -> 再训练 -> ...
+    
+    增强版：要求连续稳定一段时间才允许拓扑更新
     """
     
-    def __init__(self, patience: int = 50, variance_threshold: float = 0.05):
+    def __init__(self, patience: int = 50, variance_threshold: float = 0.20,
+                 min_stable_steps: int = 15):
         # Loss tracking
         self.loss_history = []
         self.ib_loss_history = []
         self.patience = patience
-        self.variance_threshold = variance_threshold
+        self.variance_threshold = variance_threshold  # CV < 20% is stable
         
         # Stability state
         self.is_stable = False
+        self.consecutive_stable_steps = 0  # 连续稳定的步数
+        self.min_stable_steps = min_stable_steps  # 至少稳定这么多步
         self.steps_since_topology_update = 0
-        self.min_steps_between_updates = 200  # 不能太频繁
+        self.min_steps_between_updates = 80  # 更频繁更新以测试
         
         # Performance tracking for adaptive updates
         self.pre_update_loss = None
@@ -232,6 +368,7 @@ class StabilityGuard:
             self.post_update_losses.append(loss)
         
         # Check stability (loss converging)
+        was_stable = self.is_stable
         if len(self.loss_history) >= self.patience:
             recent = self.loss_history[-self.patience:]
             mean_loss = np.mean(recent)
@@ -243,17 +380,26 @@ class StabilityGuard:
                 self.is_stable = cv < self.variance_threshold
             else:
                 self.is_stable = False
+        
+        # 追踪连续稳定步数
+        if self.is_stable:
+            self.consecutive_stable_steps += 1
+        else:
+            self.consecutive_stable_steps = 0
                 
     def should_update_topology(self) -> bool:
         """Check if it's time to update topology.
         
-        条件：
+        条件（增强版）：
         1. 权重已稳定 (loss converged)
-        2. 距离上次更新足够久
-        3. IB loss 健康
+        2. 连续稳定足够长时间 (避免偶然稳定)
+        3. 距离上次更新足够久
+        4. IB loss 健康
         """
         if not self.is_stable:
             return False
+        if self.consecutive_stable_steps < self.min_stable_steps:
+            return False  # 必须连续稳定足够久
         if self.steps_since_topology_update < self.min_steps_between_updates:
             return False
         if not self._check_ib_health():
@@ -279,6 +425,7 @@ class StabilityGuard:
         """Called after topology update finishes. Evaluate effect."""
         self.steps_since_topology_update = 0
         self.is_stable = False  # Reset, need to re-stabilize
+        self.consecutive_stable_steps = 0  # 重置连续稳定计数
         
     def evaluate_last_update(self) -> float:
         """Evaluate the effect of last topology update.
@@ -322,17 +469,28 @@ class ForwardHook:
     def __call__(self, module, input, output):
         if len(input) > 0 and isinstance(input[0], torch.Tensor):
             input_act = input[0]
-            # Flatten if needed (handle sequence dimension)
-            if input_act.dim() == 3:
-                input_act = input_act.mean(dim=1)  # (batch, seq, dim) -> (batch, dim)
-            
-            self.scheduler.activity_tracker.cache_input(self.layer_name, input_act)
-            
             output_act = output
-            if output_act.dim() == 3:
-                output_act = output_act.mean(dim=1)
+            
+            # 兼容旧的tracker
+            if input_act.dim() == 3:
+                input_act_mean = input_act.mean(dim=1)
+            else:
+                input_act_mean = input_act
                 
-            self.scheduler.hebbian_tracker.record(self.layer_name, input_act, output_act)
+            self.scheduler.activity_tracker.cache_input(self.layer_name, input_act_mean)
+            
+            if output_act.dim() == 3:
+                output_act_mean = output_act.mean(dim=1)
+            else:
+                output_act_mean = output_act
+                
+            self.scheduler.hebbian_tracker.record(self.layer_name, input_act_mean, output_act_mean)
+            
+            # 新的NeuronLevelTopology: 缓存激活
+            if self.layer_name in self.scheduler.topologies:
+                self.scheduler.topologies[self.layer_name].cache_activations(
+                    input_act, output_act
+                )
 
 
 class BackwardHook:
@@ -345,6 +503,10 @@ class BackwardHook:
     def __call__(self, grad: torch.Tensor) -> torch.Tensor:
         weight = self.scheduler.weights[self.layer_name]
         self.scheduler.activity_tracker.update(self.layer_name, weight, grad)
+        
+        # 新的NeuronLevelTopology: 更新importance
+        if self.layer_name in self.scheduler.topologies:
+            self.scheduler.topologies[self.layer_name].update_importance(grad)
         
         # Apply mask to gradient
         mask = self.scheduler.masks[self.layer_name]
@@ -388,9 +550,10 @@ class NeuroplasticScheduler:
             'max_density': 1.5,
             'growth_ratio': 0.05,
             
-            # Stability
-            'stability_patience': 5,
-            'variance_threshold': 0.3,
+            # Stability - 拓扑更新前需要微调到稳定状态
+            'stability_patience': 50,      # 检测50步内的稳定性
+            'variance_threshold': 0.35,    # CV<35%认为稳定（测试更宽松）
+            'min_stable_steps': 10,        # 连续稳定10步才允许更新
             
             # Layer patterns - now covers ITHP + DeBERTa FFN (51% of params)
             'target_patterns': [
@@ -413,16 +576,57 @@ class NeuroplasticScheduler:
         self.activity_tracker = ActivityTracker(self.config['ema_alpha'])
         self.hebbian_tracker = HebbianTracker()
         self.stability_guard = StabilityGuard(
-            self.config['stability_patience'],
-            self.config['variance_threshold']
+            patience=self.config['stability_patience'],
+            variance_threshold=self.config['variance_threshold'],
+            min_stable_steps=self.config.get('min_stable_steps', 50)
         )
         
-        # RL-based adaptive policy for update magnitude
+        # ============ 独立的连续RL策略 (替代离散UCB) ============
+        # Prune策略：独立学习最优prune scale
+        self.prune_policy = ContinuousScalePolicy(
+            name="prune",
+            init_mean=0.05,      # 初始均值5%
+            init_std=0.02,       # 初始探索范围
+            min_scale=0.005,     # 最小0.5%
+            max_scale=0.15,      # 最大15%
+            lr_mean=0.01,
+            lr_std=0.005,
+        )
+        
+        # Grow策略：独立学习最优grow scale（不再与prune绑定）
+        self.grow_policy = ContinuousScalePolicy(
+            name="grow",
+            init_mean=0.03,      # 初始比prune保守
+            init_std=0.015,      # 探索范围
+            min_scale=0.005,     # 最小0.5%
+            max_scale=0.12,      # 最大12%（比prune保守）
+            lr_mean=0.01,
+            lr_std=0.005,
+        )
+        
+        # 图边连接：独立策略，学习图边的最优更新幅度（保留供graph_fusion使用）
+        self.graph_policy = ContinuousScalePolicy(
+            name="graph",
+            init_mean=0.10,      # 图边初始均值10%（比权重激进一些）
+            init_std=0.03,       # 更大探索范围
+            min_scale=0.02,      # 最小2%（避免太保守）
+            max_scale=0.25,      # 最大25%（允许激进更新）
+            lr_mean=0.015,       # 稍快学习
+            lr_std=0.008,
+        )
+        
+        # 保留旧的UCB策略作为备用
         self.update_policy = AdaptiveUpdatePolicy(
             scales=[0.02, 0.05, 0.08, 0.1]
         )
         self.pending_ucb_reward_step = None  # Step at which to provide UCB reward
         self.ucb_reward_delay = 100  # Wait this many steps to evaluate effect
+        
+        # 连续策略reward收集
+        self.pending_prune_reward_step = None
+        self.pending_grow_reward_step = None
+        self.pending_graph_reward_step = None
+        self.reward_delay = 50  # 50步后评估效果
         
         # Storage
         self.masks: Dict[str, torch.Tensor] = {}
@@ -435,11 +639,40 @@ class NeuroplasticScheduler:
         self.prune_count = 0
         self.growth_count = 0
         
+        # Graph fusion neuroplasticity (if model has graph_fusion)
+        self.graph_fusion = None
+        self._init_graph_fusion()
+        
         # Initialize
         self._init_layers()
         self._register_hooks()
         self._wrap_optimizer()
         
+        # ============ 全局神经元图（统一prune/grow） ============
+        self.global_graph = GlobalNeuronGraph(sw_beta=2.0, sf_gamma=1.0)
+        self.global_graph.build_from_model(self.model, self.config['target_patterns'])
+        # 共享mask引用
+        for name in self.masks:
+            self.global_graph.masks[name] = self.masks[name]
+            self.global_graph.weights[name] = self.weights[name]
+        
+    def _init_graph_fusion(self):
+        """Initialize graph fusion neuroplasticity if model has graph_fusion module."""
+        # Search for graph_fusion in model
+        for name, module in self.model.named_modules():
+            if hasattr(module, 'graph_fusion') and module.graph_fusion is not None:
+                self.graph_fusion = module.graph_fusion
+                break
+        
+        if self.graph_fusion is not None:
+            stats = self.graph_fusion.get_graph_stats()
+            print(f"[Neuroplastic] Graph fusion enabled: {stats['n_nodes']} nodes, {stats['n_edges']:.0f} edges")
+            print(f"  Cross-modal: text↔visual={stats['text_visual_edges']}, "
+                  f"text↔acoustic={stats['text_acoustic_edges']}, "
+                  f"visual↔acoustic={stats['visual_acoustic_edges']}")
+        else:
+            print(f"[Neuroplastic] Graph fusion: not found or disabled")
+    
     def _should_track(self, name: str, module: nn.Module) -> bool:
         """Check if layer should be tracked"""
         if not isinstance(module, nn.Linear):
@@ -450,7 +683,10 @@ class NeuroplasticScheduler:
         return False
     
     def _init_layers(self):
-        """Initialize masks and tracking for target layers"""
+        """Initialize masks, tracking, and NeuronLevelTopology for target layers"""
+        # 神经元级拓扑管理器
+        self.topologies: Dict[str, NeuronLevelTopology] = {}
+        
         for name, module in self.model.named_modules():
             if not self._should_track(name, module):
                 continue
@@ -472,7 +708,20 @@ class NeuroplasticScheduler:
                 'initial_connections': self.initial_counts[name],
             }
             
-        print(f"[Neuroplastic] Tracking {len(self.masks)} layers")
+            # 创建 NeuronLevelTopology 实例
+            self.topologies[name] = NeuronLevelTopology(
+                name=name,
+                weight=weight,
+                mask=mask,
+                sw_beta=2.0,       # Small-World距离衰减
+                sf_alpha=0.5,      # SW与SF混合比例
+                ema_alpha=self.config['ema_alpha'],
+                min_density=0.01,
+                max_density=self.config['max_density'],
+                protect_period=5,
+            )
+            
+        print(f"[Neuroplastic] Tracking {len(self.masks)} layers with NeuronLevelTopology")
         for name, info in self.layer_info.items():
             print(f"  - {name}: {info['out_features']}x{info['in_features']} "
                   f"= {info['initial_connections']} connections")
@@ -672,84 +921,10 @@ class NeuroplasticScheduler:
         # Reset Hebbian tracker
         self.hebbian_tracker.reset()
     
-    @torch.no_grad()
-    def _manage_cross_layer_skip(self, scale: float = 0.05, prune: bool = True, grow: bool = True):
-        """Manage cross-layer skip connections with unified UCB1 control.
-        
-        Skip connections are now grown based on gradient scores (RigL-style):
-        - Growth: score[i,j] = |∂L/∂output[i]| × |input[j]|
-        - Prune: activity = |weight| × |input| × |output_grad|
-        
-        Uses the same scale as main network topology updates.
-        """
-        # Check if model has neuroplastic blocks
-        if not hasattr(self.model, 'get_all_neuroplastic_blocks'):
-            return
-        
-        blocks = self.model.get_all_neuroplastic_blocks()
-        if not blocks:
-            return
-        
-        total_skip_pruned = 0
-        total_skip_grown = 0
-        
-        if prune:
-            # Prune inactive skip connections (activity-based)
-            prune_ratio = scale  # Same as main network
-            try:
-                for block in blocks:
-                    before = block.n_skip_connections
-                    if before > 0:
-                        # Prune based on activity score
-                        activity = block.get_skip_prune_scores()
-                        active_activity = activity[block.skip_mask]
-                        if active_activity.numel() > 0:
-                            n_prune = max(1, int(active_activity.numel() * prune_ratio))
-                            sorted_activity, _ = torch.sort(active_activity)
-                            threshold = sorted_activity[min(n_prune - 1, len(sorted_activity) - 1)]
-                            
-                            weak_mask = (activity <= threshold) & block.skip_mask
-                            weak_indices = weak_mask.nonzero()
-                            
-                            for idx in weak_indices[:n_prune]:
-                                out_idx, in_idx = idx[0].item(), idx[1].item()
-                                block.remove_skip_connection(in_idx, out_idx)
-                            
-                            total_skip_pruned += (before - block.n_skip_connections)
-            except Exception as e:
-                print(f"[Neuroplastic] Skip prune error: {e}")
-        
-        if grow:
-            # Grow skip connections based on gradient scores
-            growth_ratio = scale  # Same as main network
-            try:
-                for block in blocks:
-                    # Number to grow based on current skip count or minimum
-                    current = max(block.n_skip_connections, 10)
-                    n_grow = max(1, int(current * growth_ratio))
-                    
-                    scores = block.get_skip_growth_scores()
-                    # Mask already active connections
-                    scores = scores * (~block.skip_mask.bool()).float()
-                    
-                    flat_scores = scores.flatten()
-                    k = min(n_grow, (flat_scores > 0).sum().item())
-                    if k == 0:
-                        continue
-                    
-                    _, top_indices = torch.topk(flat_scores, k)
-                    
-                    for idx in top_indices:
-                        out_idx = idx // block.in_dim
-                        in_idx = idx % block.in_dim
-                        if scores[out_idx, in_idx] > 0:
-                            if block.add_skip_connection(in_idx.item(), out_idx.item()):
-                                total_skip_grown += 1
-            except Exception as e:
-                print(f"[Neuroplastic] Skip growth error: {e}")
-        
-        if total_skip_pruned > 0 or total_skip_grown > 0:
-            print(f"  Skip connections: pruned {total_skip_pruned}, grew {total_skip_grown}")
+    # NOTE: _manage_cross_layer_skip函数已删除
+    # 统一框架只保留神经元级操作：
+    # - weight prune/grow: 通过NeuronLevelTopology处理
+    # - 不再有跨层skip connection
         
     def step(self, loss: float = None, ib_loss: float = None):
         """Call after each optimizer step.
@@ -761,141 +936,144 @@ class NeuroplasticScheduler:
         """
         self.step_count += 1
         
+        # ==================== Unified Activity Tracking ====================
+        # Update graph edge activity from gradients (before they get cleared)
+        # This enables gradient-based prune/grow for graph edges, same as weights
+        if self.graph_fusion is not None and hasattr(self.graph_fusion, 'update_edge_activity'):
+            self.graph_fusion.update_edge_activity()
+        
         # Update stability guard
         if loss is not None:
             self.stability_guard.update(loss, ib_loss)
         
-        # UCB reward feedback: evaluate effect of previous topology update
-        if (self.pending_ucb_reward_step is not None and 
-            self.step_count >= self.pending_ucb_reward_step and
+        # ============ 连续策略 Reward 反馈 ============
+        # Prune策略reward
+        if (self.pending_prune_reward_step is not None and 
+            self.step_count >= self.pending_prune_reward_step and
             len(self.stability_guard.loss_history) >= 20):
             post_loss = np.mean(self.stability_guard.loss_history[-20:])
-            self.update_policy.end_update(post_loss)
-            arm = self.update_policy.current_arm
-            scale = self.update_policy.scales[arm]
-            avg_reward = self.update_policy.rewards[arm] / max(1, self.update_policy.counts[arm])
-            print(f"[Neuroplastic] UCB reward for scale={scale:.2f}: avg_reward={avg_reward:.4f}")
-            self.pending_ucb_reward_step = None
+            sparsity_penalty = 0.0
+            self.prune_policy.end_update(post_loss, sparsity_penalty)
+            stats = self.prune_policy.get_stats()
+            print(f"[RL-Prune] μ={stats['mean']:.4f}, σ={stats['std']:.4f}, "
+                  f"reward={stats['recent_avg_reward']:.4f}")
+            self.pending_prune_reward_step = None
+        
+        # Grow策略reward
+        if (self.pending_grow_reward_step is not None and 
+            self.step_count >= self.pending_grow_reward_step and
+            len(self.stability_guard.loss_history) >= 20):
+            post_loss = np.mean(self.stability_guard.loss_history[-20:])
+            sparsity_penalty = 0.0
+            self.grow_policy.end_update(post_loss, sparsity_penalty)
+            stats = self.grow_policy.get_stats()
+            print(f"[RL-Grow] μ={stats['mean']:.4f}, σ={stats['std']:.4f}, "
+                  f"reward={stats['recent_avg_reward']:.4f}")
+            self.pending_grow_reward_step = None
+        
+        # 图边策略reward
+        if (self.pending_graph_reward_step is not None and 
+            self.step_count >= self.pending_graph_reward_step and
+            len(self.stability_guard.loss_history) >= 20):
+            post_loss = np.mean(self.stability_guard.loss_history[-20:])
+            self.graph_policy.end_update(post_loss, sparsity_penalty=0.0)
+            stats = self.graph_policy.get_stats()
+            print(f"[RL-Graph] μ={stats['mean']:.4f}, σ={stats['std']:.4f}, "
+                  f"reward={stats['recent_avg_reward']:.4f}")
+            self.pending_graph_reward_step = None
         
         # Warmup: skip topology changes during initial training
         warmup_steps = self.config.get('warmup_steps', 500)
         if self.step_count <= warmup_steps:
             if self.step_count == warmup_steps:
                 print(f"[Neuroplastic] Warmup complete at step {warmup_steps}")
-                print(f"[Neuroplastic] Mode: Stability-based adaptive updates (net-zero rewiring)")
+                print(f"[Neuroplastic] Mode: Continuous RL policies (weight + graph independent)")
             return
+        
+        # 每100步打印稳定性状态
+        if self.step_count % 100 == 0:
+            sg = self.stability_guard
+            cv = np.std(sg.loss_history[-50:]) / (np.mean(sg.loss_history[-50:]) + 1e-8) if len(sg.loss_history) >= 50 else 999
+            print(f"[StabilityCheck] step={self.step_count}, stable={sg.is_stable}, "
+                  f"consec={sg.consecutive_stable_steps}/{sg.min_stable_steps}, "
+                  f"since_update={sg.steps_since_topology_update}/{sg.min_steps_between_updates}, cv={cv:.3f}")
         
         # 新策略：基于稳定性触发，而非固定间隔
         if self.stability_guard.should_update_topology():
             self._do_adaptive_topology_update()
-            # Schedule UCB reward collection
-            self.pending_ucb_reward_step = self.step_count + self.ucb_reward_delay
             
     def _do_adaptive_topology_update(self):
-        """Perform adaptive topology update (net-zero rewiring).
+        """Perform adaptive topology update using independent RL policies.
         
-        Uses UCB1 (reinforcement learning) to select update magnitude.
+        使用三个完全独立的连续策略:
+        - prune_policy: 学习权重连接的最优prune scale
+        - grow_policy: 学习权重连接的最优grow scale (不再与prune绑定)
+        - graph_policy: 学习图边的最优prune/grow scale
+        
+        比离散UCB更精细：scale ~ N(μ, σ²)，REINFORCE更新
         """
         # Get current loss for RL reward calculation
         current_loss = np.mean(self.stability_guard.loss_history[-20:]) if len(self.stability_guard.loss_history) >= 20 else 0
         
-        # RL: Select scale using UCB1 policy
-        scale = self.update_policy.select_scale()
-        self.update_policy.begin_update(current_loss)
+        # ============ 独立采样三个策略的scale ============
+        prune_scale = self.prune_policy.sample_scale()
+        grow_scale = self.grow_policy.sample_scale()
+        graph_scale = self.graph_policy.sample_scale()
+        
+        # 记录更新前的loss
+        self.prune_policy.begin_update(current_loss)
+        self.grow_policy.begin_update(current_loss)
+        self.graph_policy.begin_update(current_loss)
         self.stability_guard.begin_topology_update()
         
-        # Print policy stats periodically
-        policy_stats = self.update_policy.get_stats()
-        print(f"\n[Neuroplastic] Step {self.step_count}: Topology update (UCB scale={scale:.2f})")
-        print(f"  UCB policy: {policy_stats}")
+        # 调度reward收集
+        self.pending_prune_reward_step = self.step_count + self.reward_delay
+        self.pending_grow_reward_step = self.step_count + self.reward_delay
+        self.pending_graph_reward_step = self.step_count + self.reward_delay
         
-        # Phase 1: Calculate how many to prune
-        total_to_prune = 0
-        prune_candidates = {}  # layer_name -> (indices, activities)
+        # Print policy stats
+        prune_stats = self.prune_policy.get_stats()
+        grow_stats = self.grow_policy.get_stats()
+        graph_stats = self.graph_policy.get_stats()
+        print(f"\n[Neuroplastic] Step {self.step_count}: Topology update (independent prune/grow)")
+        print(f"  Prune Policy: μ={prune_stats['mean']:.4f}, σ={prune_stats['std']:.4f} -> scale={prune_scale:.4f}")
+        print(f"  Grow Policy:  μ={grow_stats['mean']:.4f}, σ={grow_stats['std']:.4f} -> scale={grow_scale:.4f}")
+        print(f"  Graph Policy: μ={graph_stats['mean']:.4f}, σ={graph_stats['std']:.4f} -> scale={graph_scale:.4f}")
         
-        for name in self.masks:
-            mask = self.masks[name]
-            if name not in self.activity_tracker.activity:
-                continue
-            
-            activity = self.activity_tracker.activity[name]
-            n_active = mask.sum().item()
-            
-            # Calculate pruning amount with adaptive scale
-            base_prune_ratio = self.config['max_prune_ratio'] * scale
-            n_prune = int(n_active * base_prune_ratio)
-            
-            if n_prune > 0:
-                # Get lowest activity connections
-                threshold = self.config['prune_threshold']
-                fan_in_per_row = mask.sum(dim=1)
-                fan_out_per_col = mask.sum(dim=0)
-                
-                row_ok = (fan_in_per_row > self.config['min_fan_in']).unsqueeze(1)
-                col_ok = (fan_out_per_col > self.config['min_fan_out']).unsqueeze(0)
-                can_prune = row_ok & col_ok & mask
-                
-                activity_masked = torch.where(can_prune, activity, 
-                                             torch.tensor(float('inf'), device=activity.device))
-                flat = activity_masked.flatten()
-                _, indices = torch.topk(flat, min(n_prune, (flat < float('inf')).sum().item()), largest=False)
-                
-                prune_candidates[name] = indices
-                total_to_prune += len(indices)
+        # ============ 全局统一 prune/grow ============
+        # 收集每层的importance和co_activation
+        importance_dict = {}
+        co_activation_dict = {}
         
-        # Phase 2: Execute pruning (independent)
-        actual_pruned = 0
-        for name, indices in prune_candidates.items():
-            mask = self.masks[name]
-            weight = self.weights[name]
+        for name, topology in self.topologies.items():
+            if topology.importance is not None:
+                importance_dict[name] = topology.importance
+            else:
+                # Fallback: 用权重绝对值
+                importance_dict[name] = topology.weight.abs()
             
-            prune_mask = torch.zeros_like(mask)
-            prune_mask.view(-1)[indices] = True
+            if topology.co_activation is not None:
+                co_activation_dict[name] = topology.co_activation
+            else:
+                # Fallback: uniform
+                co_activation_dict[name] = torch.ones_like(topology.weight)
             
-            n_pruned = prune_mask.sum().item()
-            mask[prune_mask] = False
-            weight.data[prune_mask] = 0
-            actual_pruned += n_pruned
+            # 增加connection age（保护新连接）
+            topology.step_age()
         
-        # Phase 3: Execute growth (independent, based on growth_ratio)
-        actual_grown = 0
-        growth_ratio = self.config['growth_ratio'] * scale
+        # 全局图统一prune/grow
+        topo_result = self.global_graph.topology_step(
+            importance_dict=importance_dict,
+            co_activation_dict=co_activation_dict,
+            prune_scale=prune_scale * self.config['max_prune_ratio'],
+            grow_scale=grow_scale * self.config['growth_ratio'],
+        )
         
-        for name in self.masks:
-            mask = self.masks[name]
-            weight = self.weights[name]
-            initial = self.initial_counts[name]
-            current = mask.sum().item()
-            
-            # Allow growing up to max_density
-            max_allowed = int(initial * self.config['max_density'])
-            space = max_allowed - current
-            
-            if space <= 0:
-                continue
-            
-            # Independent growth amount
-            n_grow = min(int(current * growth_ratio), space)
-            if n_grow <= 0:
-                continue
-            
-            indices = self.hebbian_tracker.get_growth_candidates(name, mask, n_grow)
-            if len(indices) == 0:
-                continue
-            
-            grow_mask = torch.zeros_like(mask)
-            grow_mask.view(-1)[indices] = True
-            grow_mask = grow_mask & (~mask)
-            
-            n_grown = grow_mask.sum().item()
-            if n_grown > 0:
-                mask[grow_mask] = True
-                avg_fan_in = mask.sum(dim=1).float().mean().item()
-                std = 0.1 / math.sqrt(max(avg_fan_in, 1))
-                weight.data[grow_mask] = torch.randn(n_grown, device=weight.device) * std
-                actual_grown += n_grown
+        actual_pruned = topo_result['pruned']
+        actual_grown = topo_result['grown']
         
-        print(f"  Result: pruned {actual_pruned}, grew {actual_grown} (independent)")
+        print(f"  Result: pruned {actual_pruned}, grew {actual_grown} (GlobalNeuronGraph unified)")
+        print(f"  Active edges: {topo_result['active_edges']}, density: {topo_result['density']:.4f}")
         
         # Update counters
         if actual_pruned > 0:
@@ -903,8 +1081,20 @@ class NeuroplasticScheduler:
         if actual_grown > 0:
             self.growth_count += 1
         
-        # Cross-layer skip updates (unified with main network using same scale)
-        self._manage_cross_layer_skip(scale=scale, prune=True, grow=True)
+        # TODO: 已删除skip connection逻辑（只保留神经元级操作）
+        # Cross-layer skip updates removed - neuron-level only
+        
+        # Graph fusion neuroplastic update (uses independent graph_policy)
+        if self.graph_fusion is not None:
+            # 使用独立的graph_policy scale（不再是权重scale的系数）
+            edge_stats = self.graph_fusion.neuroplastic_step(
+                prune_ratio=graph_scale,   # 直接使用图策略学到的scale
+                grow_ratio=graph_scale * 0.9  # 稍微保守的growth（避免边数膨胀）
+            )
+            activity_info = "activity-based" if edge_stats.get('has_activity', False) else "fallback"
+            print(f"  Graph edges: pruned {edge_stats['n_pruned']}, grew {edge_stats['n_grown']}, "
+                  f"total={edge_stats['n_edges']:.0f}, cross-modal={edge_stats['cross_modal_edges']} "
+                  f"(mode: {activity_info}, scale={graph_scale:.4f})")
         
         # RigL-style cleanup: reset momentum and apply gradient masking
         self.reset_momentum()
@@ -912,6 +1102,8 @@ class NeuroplasticScheduler:
         
         # Reset trackers for next cycle
         self.hebbian_tracker.reset()
+        for topology in self.topologies.values():
+            topology.reset_activations()
         self.stability_guard.end_topology_update(actual_pruned, actual_grown)
         
         # Evaluate effect of previous update
@@ -974,6 +1166,24 @@ class NeuroplasticScheduler:
             except Exception:
                 pass
         
+        # Add graph fusion statistics
+        if self.graph_fusion is not None:
+            try:
+                graph_stats = self.graph_fusion.get_graph_stats()
+                stats['graph_fusion'] = {
+                    'n_nodes': graph_stats['n_nodes'],
+                    'n_edges': graph_stats['n_edges'],
+                    'edge_density': graph_stats['edge_density'],
+                    'text_visual_edges': graph_stats['text_visual_edges'],
+                    'text_acoustic_edges': graph_stats['text_acoustic_edges'],
+                    'visual_acoustic_edges': graph_stats['visual_acoustic_edges'],
+                    'cross_modal_total': (graph_stats['text_visual_edges'] + 
+                                          graph_stats['text_acoustic_edges'] + 
+                                          graph_stats['visual_acoustic_edges']),
+                }
+            except Exception:
+                pass
+        
         return stats
     
     def print_stats(self):
@@ -993,3 +1203,11 @@ class NeuroplasticScheduler:
             if skip_total:
                 print(f"  Cross-layer skip: {skip_total.get('active', 0)}/{skip_total.get('possible', 0)} "
                       f"({skip_total.get('ratio', 0):.2%})")
+        
+        # Print graph fusion stats
+        if 'graph_fusion' in stats:
+            gf = stats['graph_fusion']
+            print(f"  Graph fusion: {gf['n_edges']:.0f} edges, density={gf['edge_density']:.3f}")
+            print(f"    Cross-modal: text↔visual={gf['text_visual_edges']}, "
+                  f"text↔acoustic={gf['text_acoustic_edges']}, "
+                  f"visual↔acoustic={gf['visual_acoustic_edges']}")

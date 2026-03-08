@@ -72,6 +72,21 @@ def get_args():
     parser.add_argument("--growth_ratio", type=float, default=0.05, help="Max fraction to grow per update")
     parser.add_argument("--no_neuroplastic", action="store_true", default=False)
     
+    # Graph fusion args (Small-World + Scale-Free)
+    parser.add_argument("--use_graph_fusion", action="store_true", default=False, help="Enable graph fusion")
+    parser.add_argument("--graph_n_heads", type=int, default=4, help="Number of attention heads in GAT")
+    parser.add_argument("--graph_n_layers", type=int, default=2, help="Number of GAT layers")
+    parser.add_argument("--graph_hidden_dim", type=int, default=256, help="Hidden dimension for graph nodes")
+    parser.add_argument("--n_visual_segments", type=int, default=8, help="Number of visual segment nodes")
+    parser.add_argument("--n_acoustic_segments", type=int, default=8, help="Number of acoustic segment nodes")
+    parser.add_argument("--sw_k", type=int, default=6, help="Small-World: k nearest neighbors")
+    parser.add_argument("--sw_p", type=float, default=0.15, help="Small-World: rewiring probability")
+    parser.add_argument("--sf_m", type=int, default=3, help="Scale-Free: edges per new node")
+    parser.add_argument("--topology_alpha", type=float, default=0.5, help="Small-World vs Scale-Free weight")
+    parser.add_argument("--learnable_topology", action="store_true", default=True, help="Learnable edge weights")
+    parser.add_argument("--cross_modal_connectivity", type=float, default=0.3, help="Cross-modal edge probability")
+    parser.add_argument("--topology_coef", type=float, default=0.01, help="Weight for topology loss")
+    
     # Checkpoint args
     parser.add_argument("--output_dir", type=str, default="./neuroplastic_checkpoints")
     parser.add_argument("--checkpoint_dir", type=str, default=None, help="Override output_dir")
@@ -246,7 +261,7 @@ def train_epoch(model, train_loader, optimizer, scheduler, np_scheduler, args):
         visual_norm = (visual - visual.min()) / (visual.max() - visual.min() + 1e-8)
         acoustic_norm = (acoustic - acoustic.min()) / (acoustic.max() - acoustic.min() + 1e-8)
         
-        logits, IB_total = model(input_ids, visual_norm, acoustic_norm)
+        logits, IB_total, topology_loss = model(input_ids, visual_norm, acoustic_norm)
         logits = logits.view(-1)  # Flatten to 1D
         label_ids = label_ids.view(-1)
         
@@ -259,7 +274,10 @@ def train_epoch(model, train_loader, optimizer, scheduler, np_scheduler, args):
         
         loss_fct = MSELoss()
         mse_loss = loss_fct(logits, smoothed_labels)
-        loss = mse_loss + args.IB_coef * IB_total
+        
+        # Total loss: MSE + IB + topology regularization
+        topology_coef = getattr(args, 'topology_coef', 0.01)
+        loss = mse_loss + args.IB_coef * IB_total + topology_coef * topology_loss
         
         loss.backward()
         
@@ -301,7 +319,8 @@ def evaluate(model, data_loader):
         visual_norm = (visual - visual.min()) / (visual.max() - visual.min() + 1e-8)
         acoustic_norm = (acoustic - acoustic.min()) / (acoustic.max() - acoustic.min() + 1e-8)
         
-        logits, _ = model(input_ids, visual_norm, acoustic_norm)
+        outputs = model(input_ids, visual_norm, acoustic_norm)
+        logits = outputs[0]  # First output is always logits
         logits = logits.squeeze(-1)
         
         preds.extend(logits.cpu().numpy().flatten())
@@ -482,6 +501,20 @@ def run_training(config_dict):
         max_prune_ratio=config_dict.get('max_prune_ratio', 0.05),
         growth_ratio=config_dict.get('growth_ratio', 0.05),
         no_neuroplastic=config_dict.get('no_neuroplastic', False),
+        # Graph fusion args
+        use_graph_fusion=config_dict.get('use_graph_fusion', False),
+        graph_n_heads=config_dict.get('graph_n_heads', 4),
+        graph_n_layers=config_dict.get('graph_n_layers', 2),
+        graph_hidden_dim=config_dict.get('graph_hidden_dim', 256),
+        n_visual_segments=config_dict.get('n_visual_segments', 8),
+        n_acoustic_segments=config_dict.get('n_acoustic_segments', 8),
+        sw_k=config_dict.get('sw_k', 6),
+        sw_p=config_dict.get('sw_p', 0.15),
+        sf_m=config_dict.get('sf_m', 3),
+        topology_alpha=config_dict.get('topology_alpha', 0.5),
+        learnable_topology=config_dict.get('learnable_topology', True),
+        cross_modal_connectivity=config_dict.get('cross_modal_connectivity', 0.3),
+        topology_coef=config_dict.get('topology_coef', 0.01),
         # Checkpoint args
         output_dir=config_dict.get('output_dir', './optuna_checkpoints'),
         checkpoint_dir=config_dict.get('checkpoint_dir', None),
