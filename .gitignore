@@ -1,0 +1,25 @@
+# Checkpoints (too large)
+neuroplastic_checkpoints/
+optuna_checkpoints/
+optuna_checkpoints_v2/
+optuna_checkpoints_v3/
+*.pt
+
+# Optuna databases
+*.db
+
+# Logs
+logs/
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Data
+datasets/
+
+# Editor
+.vscode/
+*.swp

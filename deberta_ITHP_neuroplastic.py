@@ -80,9 +80,13 @@ class NeuroplasticBlock(nn.Module):
                            torch.zeros(out_dim, in_dim, dtype=torch.bool))
         self.skip_weight = nn.Parameter(torch.zeros(out_dim, in_dim))
         
-        # Cache for co-activation tracking
+        # Cache for gradient-based skip tracking
         self.register_buffer('input_cache', torch.zeros(1))
         self.register_buffer('output_cache', torch.zeros(1))
+        self.register_buffer('output_grad_cache', torch.zeros(1))
+        
+        # Register gradient hook
+        self._grad_hook_registered = False
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward with optional cross-layer skip."""
@@ -111,7 +115,7 @@ class NeuroplasticBlock(nn.Module):
         out = self.output_activation(out)
         out = self.output_dropout(out)
             
-        # Cache output for Hebbian tracking (ensure 1D)
+        # Cache output for tracking (ensure 1D)
         if self.training:
             if out.dim() == 3:  # (batch, seq, dim)
                 self.output_cache = out.detach().mean(dim=(0, 1))  # -> (dim,)
@@ -120,7 +124,23 @@ class NeuroplasticBlock(nn.Module):
             else:
                 self.output_cache = out.detach()
             
+            # Register gradient hook to capture output gradients
+            if out.requires_grad and not self._grad_hook_registered:
+                out.register_hook(self._save_output_grad)
+                self._grad_hook_registered = True
+            
         return out
+    
+    def _save_output_grad(self, grad: torch.Tensor):
+        """Hook to save output gradients for skip connection scoring."""
+        if grad is not None:
+            if grad.dim() == 3:  # (batch, seq, dim)
+                self.output_grad_cache = grad.detach().abs().mean(dim=(0, 1))
+            elif grad.dim() == 2:  # (batch, dim)
+                self.output_grad_cache = grad.detach().abs().mean(dim=0)
+            else:
+                self.output_grad_cache = grad.detach().abs()
+        self._grad_hook_registered = False  # Reset for next forward
     
     @property
     def n_skip_connections(self) -> int:
@@ -150,18 +170,43 @@ class NeuroplasticBlock(nn.Module):
         self.skip_weight.data[out_idx, in_idx] = 0
         return True
     
-    def get_co_activation_scores(self) -> torch.Tensor:
-        """Compute co-activation scores for potential skip connections.
+    def get_skip_growth_scores(self) -> torch.Tensor:
+        """Compute gradient-based scores for potential skip connections.
         
-        Returns: (out_dim, in_dim) tensor of co-activation scores.
-        High scores indicate strong candidates for new skip connections.
+        Returns: (out_dim, in_dim) tensor of skip growth scores.
+        High scores indicate input->output pairs where a direct connection
+        would significantly reduce the loss (RigL-style growth).
+        
+        score[i,j] = |∂L/∂output[i]| × |input[j]|
+        If this is high -> connecting input[j] directly to output[i] helps.
         """
-        if self.input_cache.numel() == 1 or self.output_cache.numel() == 1:
+        if self.input_cache.numel() == 1 or self.output_grad_cache.numel() == 1:
             return torch.zeros(self.out_dim, self.in_dim, device=self.skip_weight.device)
-            
-        # Co-activation: |output_i| * |input_j|
-        scores = torch.outer(self.output_cache.abs(), self.input_cache.abs())
+        
+        # Gradient-based: |output_grad[i]| * |input[j]|
+        # High gradient at output[i] + high activation at input[j] 
+        # -> direct connection would help
+        scores = torch.outer(self.output_grad_cache, self.input_cache.abs())
         return scores
+    
+    def get_skip_prune_scores(self) -> torch.Tensor:
+        """Get activity scores for existing skip connections (for pruning).
+        
+        Returns: (out_dim, in_dim) tensor of activity scores.
+        Low scores indicate skip connections that should be pruned.
+        
+        activity = |weight| × |input| × |output_grad|
+        """
+        if self.input_cache.numel() == 1 or self.output_grad_cache.numel() == 1:
+            return torch.zeros(self.out_dim, self.in_dim, device=self.skip_weight.device)
+        
+        # Activity = |weight| × |input| × |grad|
+        activity = (
+            self.skip_weight.data.abs() *
+            self.input_cache.abs().unsqueeze(0) *
+            self.output_grad_cache.unsqueeze(1)
+        )
+        return activity
 
 
 class ITHP_Neuroplastic(nn.Module):
@@ -412,40 +457,55 @@ class ITHP_DeBertaForSequenceClassification_Neuroplastic(nn.Module):
         return self.deberta_ithp.get_all_neuroplastic_blocks()
     
     def grow_skip_connections(self, growth_count: int = 5):
-        """Grow top-k skip connections based on co-activation scores."""
+        """Grow top-k skip connections based on gradient scores (RigL-style).
+        
+        Uses gradient information: connections where |∂L/∂output| × |input| is high
+        would reduce loss if added.
+        """
         for block in self.get_all_neuroplastic_blocks():
-            scores = block.get_co_activation_scores()
+            scores = block.get_skip_growth_scores()
             # Mask already active connections
             scores = scores * (~block.skip_mask.bool()).float()
             
             # Get top-k candidates
             flat_scores = scores.flatten()
-            _, top_indices = torch.topk(flat_scores, min(growth_count, flat_scores.numel()))
+            k = min(growth_count, (flat_scores > 0).sum().item())
+            if k == 0:
+                continue
+                
+            _, top_indices = torch.topk(flat_scores, k)
             
             for idx in top_indices:
                 out_idx = idx // block.in_dim
                 in_idx = idx % block.in_dim
-                if scores[out_idx, in_idx] > 0:  # Only grow if non-zero co-activation
+                if scores[out_idx, in_idx] > 0:  # Only grow if non-zero gradient score
                     block.add_skip_connection(in_idx.item(), out_idx.item())
     
     def prune_skip_connections(self, prune_ratio: float = 0.1):
-        """Prune weak skip connections based on weight magnitude."""
+        """Prune inactive skip connections based on activity (RigL-style).
+        
+        Uses activity = |weight| × |input| × |output_grad|.
+        Low activity connections are pruned.
+        """
         for block in self.get_all_neuroplastic_blocks():
             if block.skip_mask.sum() == 0:
                 continue
-                
-            # Get active skip weights
-            active_weights = block.skip_weight.data[block.skip_mask]
-            if active_weights.numel() == 0:
+            
+            # Get activity scores for existing connections
+            activity = block.get_skip_prune_scores()
+            
+            # Only consider active connections
+            active_activity = activity[block.skip_mask]
+            if active_activity.numel() == 0:
                 continue
             
-            # Prune bottom prune_ratio by magnitude
-            threshold_idx = max(1, int(active_weights.numel() * prune_ratio))
-            sorted_weights, _ = torch.sort(active_weights.abs())
-            threshold = sorted_weights[threshold_idx - 1]
+            # Prune bottom prune_ratio by activity
+            threshold_idx = max(1, int(active_activity.numel() * prune_ratio))
+            sorted_activity, _ = torch.sort(active_activity)
+            threshold = sorted_activity[threshold_idx - 1]
             
             # Remove connections below threshold
-            weak_mask = (block.skip_weight.data.abs() <= threshold) & block.skip_mask
+            weak_mask = (activity <= threshold) & block.skip_mask
             weak_indices = weak_mask.nonzero()
             
             for idx in weak_indices:

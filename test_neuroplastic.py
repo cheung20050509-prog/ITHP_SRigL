@@ -321,7 +321,8 @@ def main():
     # Filter out cache buffers that may have different shapes (they're only for training)
     state_dict = ckpt['model_state_dict']
     filtered_state_dict = {k: v for k, v in state_dict.items() 
-                          if 'input_cache' not in k and 'output_cache' not in k}
+                          if 'input_cache' not in k and 'output_cache' not in k 
+                          and 'output_grad_cache' not in k}
     model.load_state_dict(filtered_state_dict, strict=False)
     print(f"  Loaded from epoch {ckpt.get('epoch', 'N/A')}")
     if 'best_acc' in ckpt:

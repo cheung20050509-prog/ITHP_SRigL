@@ -43,9 +43,12 @@ def get_args():
     parser.add_argument("--n_epochs", type=int, default=30)
     parser.add_argument("--dropout_prob", type=float, default=0.5)
     parser.add_argument("--learning_rate", type=float, default=1e-5)
+    parser.add_argument("--weight_decay", type=float, default=0.01, help="L2 regularization")
     parser.add_argument("--gradient_accumulation_step", type=int, default=1)
     parser.add_argument("--warmup_proportion", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=128)
+    parser.add_argument("--label_smoothing", type=float, default=0.0, help="Label noise for regularization")
+    parser.add_argument("--early_stopping_patience", type=int, default=0, help="Stop if no improvement for N epochs (0=disabled)")
     
     # ITHP args
     parser.add_argument('--inter_dim', default=256, type=int)
@@ -54,7 +57,8 @@ def get_args():
     parser.add_argument('--p_beta', default=8, type=float)
     parser.add_argument('--p_gamma', default=32, type=float)
     parser.add_argument('--beta_shift', default=1.0, type=float)
-    parser.add_argument('--IB_coef', default=10, type=float)
+    # IB_coef: original ITHP uses 2/(p_beta+p_gamma) = 2/40 = 0.05
+    parser.add_argument('--IB_coef', default=0.05, type=float)
     parser.add_argument('--B0_dim', default=128, type=int)
     parser.add_argument('--B1_dim', default=64, type=int)
     
@@ -196,7 +200,7 @@ def prep_for_training(args, num_train_steps):
     model = ITHP_DeBertaForSequenceClassification_Neuroplastic(config, args)
     model = model.to(DEVICE)
     
-    optimizer = AdamW(model.parameters(), lr=args.learning_rate)
+    optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
         num_warmup_steps=int(num_train_steps * args.warmup_proportion),
@@ -246,8 +250,15 @@ def train_epoch(model, train_loader, optimizer, scheduler, np_scheduler, args):
         logits = logits.view(-1)  # Flatten to 1D
         label_ids = label_ids.view(-1)
         
+        # Label smoothing for regression (add small noise to labels)
+        if args.label_smoothing > 0:
+            noise = torch.randn_like(label_ids) * args.label_smoothing
+            smoothed_labels = label_ids + noise
+        else:
+            smoothed_labels = label_ids
+        
         loss_fct = MSELoss()
-        mse_loss = loss_fct(logits, label_ids)
+        mse_loss = loss_fct(logits, smoothed_labels)
         loss = mse_loss + args.IB_coef * IB_total
         
         loss.backward()
@@ -373,7 +384,7 @@ def main():
     print(f"Synaptic targets: ITHP + DeBERTa FFN")
     print("=" * 60)
     
-    best_acc = 0
+    best_mae = float('inf')
     
     for epoch in range(1, args.n_epochs + 1):
         print(f"\nEpoch {epoch}/{args.n_epochs}")
@@ -388,16 +399,16 @@ def main():
         if np_scheduler is not None:
             np_scheduler.print_stats()
         
-        # Save best model (based on Acc2)
-        if dev_metrics['acc2'] > best_acc:
-            best_acc = dev_metrics['acc2']
+        # Save best model (based on MAE - lower is better)
+        if dev_metrics['mae'] < best_mae:
+            best_mae = dev_metrics['mae']
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'best_acc': best_acc,
+                'best_mae': best_mae,
             }, os.path.join(args.output_dir, 'best_model.pt'))
-            print(f"  -> Saved best model (acc2={best_acc:.4f})")
+            print(f"  -> Saved best model (MAE={best_mae:.4f})")
         
         # Periodic save
         if epoch % args.save_every == 0:
@@ -421,6 +432,131 @@ def main():
     
     if np_scheduler is not None:
         np_scheduler.print_stats()
+    
+    return test_metrics
+
+
+def run_training(config_dict):
+    """
+    Run training with a config dictionary. For Optuna optimization.
+    Returns test metrics dict: {acc2, acc7, f1, mae, corr}
+    """
+    import argparse
+    
+    # Build args from config
+    parser = argparse.ArgumentParser()
+    args = argparse.Namespace(
+        # Model args
+        model="microsoft/deberta-v3-base",
+        dataset=config_dict.get('dataset', 'mosi'),
+        max_seq_length=50,
+        # Training args
+        train_batch_size=config_dict.get('train_batch_size', 32),
+        dev_batch_size=128,
+        test_batch_size=128,
+        n_epochs=config_dict.get('n_epochs', 60),
+        dropout_prob=0.5,
+        learning_rate=config_dict.get('learning_rate', 1e-5),
+        weight_decay=config_dict.get('weight_decay', 0.01),
+        gradient_accumulation_step=1,
+        warmup_proportion=config_dict.get('warmup_proportion', 0.1),
+        seed=config_dict.get('seed', 128),
+        label_smoothing=config_dict.get('label_smoothing', 0.0),
+        early_stopping_patience=config_dict.get('early_stopping_patience', 0),
+        # ITHP args
+        inter_dim=256,
+        drop_prob=config_dict.get('drop_prob', 0.3),
+        p_lambda=config_dict.get('p_lambda', 0.3),
+        p_beta=config_dict.get('p_beta', 8),
+        p_gamma=config_dict.get('p_gamma', 32),
+        beta_shift=1.0,
+        IB_coef=config_dict.get('IB_coef', 0.05),
+        B0_dim=128,
+        B1_dim=64,
+        # Neuroplastic args
+        warmup_steps=config_dict.get('warmup_steps', 800),
+        prune_interval=config_dict.get('prune_interval', 200),
+        growth_interval=config_dict.get('growth_interval', 200),
+        prune_threshold=0.001,
+        max_density=1.5,
+        max_prune_ratio=config_dict.get('max_prune_ratio', 0.05),
+        growth_ratio=config_dict.get('growth_ratio', 0.05),
+        no_neuroplastic=config_dict.get('no_neuroplastic', False),
+        # Checkpoint args
+        output_dir=config_dict.get('output_dir', './optuna_checkpoints'),
+        checkpoint_dir=config_dict.get('checkpoint_dir', None),
+        save_every=5,
+    )
+    
+    # Set global dimensions
+    global ACOUSTIC_DIM, VISUAL_DIM, TEXT_DIM
+    if args.dataset == "mosi":
+        ACOUSTIC_DIM = global_configs.ACOUSTIC_DIM = 74
+        VISUAL_DIM = global_configs.VISUAL_DIM = 47
+    else:
+        ACOUSTIC_DIM = global_configs.ACOUSTIC_DIM = 74
+        VISUAL_DIM = global_configs.VISUAL_DIM = 35
+    TEXT_DIM = global_configs.TEXT_DIM = 768
+    
+    # Set seed
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    
+    # Create output dir
+    if args.checkpoint_dir:
+        args.output_dir = args.checkpoint_dir
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Load data
+    train_loader, dev_loader, test_loader = set_up_data_loader(args)
+    num_train_steps = len(train_loader) * args.n_epochs
+    
+    # Setup model
+    model, optimizer, scheduler, np_scheduler = prep_for_training(args, num_train_steps)
+    
+    best_mae = float('inf')
+    best_dev_metrics = None
+    epochs_without_improvement = 0
+    
+    for epoch in range(1, args.n_epochs + 1):
+        train_loss = train_epoch(model, train_loader, optimizer, scheduler, np_scheduler, args)
+        dev_metrics = evaluate(model, dev_loader)
+        
+        # Print dev metrics every epoch (compact format)
+        improved = dev_metrics['mae'] < best_mae
+        marker = " *BEST*" if improved else ""
+        print(f"  Epoch {epoch:2d}: MAE={dev_metrics['mae']:.4f}, Acc2={dev_metrics['acc2']:.4f}, "
+              f"Acc7={dev_metrics['acc7']:.4f}, Corr={dev_metrics['corr']:.4f}{marker}", flush=True)
+        
+        if improved:
+            best_mae = dev_metrics['mae']
+            best_dev_metrics = dev_metrics.copy()
+            epochs_without_improvement = 0
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'best_mae': best_mae,
+            }, os.path.join(args.output_dir, 'best_model.pt'))
+        else:
+            epochs_without_improvement += 1
+        
+        # Early stopping
+        if args.early_stopping_patience > 0 and epochs_without_improvement >= args.early_stopping_patience:
+            print(f"  Early stopping at epoch {epoch} (no improvement for {args.early_stopping_patience} epochs)")
+            break
+    
+    # Final test
+    ckpt = torch.load(os.path.join(args.output_dir, 'best_model.pt'))
+    model.load_state_dict(ckpt['model_state_dict'])
+    test_metrics = evaluate(model, test_loader)
+    
+    return {
+        'test': test_metrics,
+        'dev': best_dev_metrics,
+    }
 
 
 if __name__ == "__main__":

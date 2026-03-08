@@ -507,6 +507,37 @@ class NeuroplasticScheduler:
         """Apply masks to weights"""
         for name, mask in self.masks.items():
             self.weights[name].data *= mask.float()
+    
+    def reset_momentum(self):
+        """Reset optimizer momentum for pruned/grown connections (RigL-style)."""
+        for group in self.optimizer.param_groups:
+            for p in group['params']:
+                # Find which weight this parameter corresponds to
+                param_name = None
+                for name, weight in self.weights.items():
+                    if p is weight:
+                        param_name = name
+                        break
+                if param_name is None:
+                    continue
+                    
+                mask = self.masks[param_name]
+                state = self.optimizer.state.get(p, {})
+                
+                # Reset momentum buffers for masked positions
+                if 'momentum_buffer' in state:  # SGD
+                    state['momentum_buffer'] *= mask.float()
+                if 'exp_avg' in state:  # Adam first moment
+                    state['exp_avg'] *= mask.float()
+                if 'exp_avg_sq' in state:  # Adam second moment
+                    state['exp_avg_sq'] *= mask.float()
+    
+    def apply_mask_to_gradients(self):
+        """Ensure gradients are zero for pruned connections (RigL-style)."""
+        for name, mask in self.masks.items():
+            weight = self.weights[name]
+            if weight.grad is not None:
+                weight.grad *= mask.float()
             
     def _get_modification_strength(self) -> float:
         """Get current modification strength (decays over training)"""
@@ -642,33 +673,83 @@ class NeuroplasticScheduler:
         self.hebbian_tracker.reset()
     
     @torch.no_grad()
-    def _manage_cross_layer_skip(self, grow: bool = False, prune: bool = False):
-        """Manage cross-layer skip connections in NeuroplasticBlocks.
+    def _manage_cross_layer_skip(self, scale: float = 0.05, prune: bool = True, grow: bool = True):
+        """Manage cross-layer skip connections with unified UCB1 control.
         
-        These are the within-block input->output skip connections that 
-        bypass the hidden layer, providing true synaptic-level plasticity.
+        Skip connections are now grown based on gradient scores (RigL-style):
+        - Growth: score[i,j] = |∂L/∂output[i]| × |input[j]|
+        - Prune: activity = |weight| × |input| × |output_grad|
+        
+        Uses the same scale as main network topology updates.
         """
         # Check if model has neuroplastic blocks
         if not hasattr(self.model, 'get_all_neuroplastic_blocks'):
             return
         
-        strength = self._get_modification_strength()
+        blocks = self.model.get_all_neuroplastic_blocks()
+        if not blocks:
+            return
+        
+        total_skip_pruned = 0
+        total_skip_grown = 0
+        
+        if prune:
+            # Prune inactive skip connections (activity-based)
+            prune_ratio = scale  # Same as main network
+            try:
+                for block in blocks:
+                    before = block.n_skip_connections
+                    if before > 0:
+                        # Prune based on activity score
+                        activity = block.get_skip_prune_scores()
+                        active_activity = activity[block.skip_mask]
+                        if active_activity.numel() > 0:
+                            n_prune = max(1, int(active_activity.numel() * prune_ratio))
+                            sorted_activity, _ = torch.sort(active_activity)
+                            threshold = sorted_activity[min(n_prune - 1, len(sorted_activity) - 1)]
+                            
+                            weak_mask = (activity <= threshold) & block.skip_mask
+                            weak_indices = weak_mask.nonzero()
+                            
+                            for idx in weak_indices[:n_prune]:
+                                out_idx, in_idx = idx[0].item(), idx[1].item()
+                                block.remove_skip_connection(in_idx, out_idx)
+                            
+                            total_skip_pruned += (before - block.n_skip_connections)
+            except Exception as e:
+                print(f"[Neuroplastic] Skip prune error: {e}")
         
         if grow:
-            # Grow skip connections based on co-activation
-            growth_count = max(1, int(5 * strength))  # 5 -> 1 as training progresses
+            # Grow skip connections based on gradient scores
+            growth_ratio = scale  # Same as main network
             try:
-                self.model.grow_skip_connections(growth_count)
+                for block in blocks:
+                    # Number to grow based on current skip count or minimum
+                    current = max(block.n_skip_connections, 10)
+                    n_grow = max(1, int(current * growth_ratio))
+                    
+                    scores = block.get_skip_growth_scores()
+                    # Mask already active connections
+                    scores = scores * (~block.skip_mask.bool()).float()
+                    
+                    flat_scores = scores.flatten()
+                    k = min(n_grow, (flat_scores > 0).sum().item())
+                    if k == 0:
+                        continue
+                    
+                    _, top_indices = torch.topk(flat_scores, k)
+                    
+                    for idx in top_indices:
+                        out_idx = idx // block.in_dim
+                        in_idx = idx % block.in_dim
+                        if scores[out_idx, in_idx] > 0:
+                            if block.add_skip_connection(in_idx.item(), out_idx.item()):
+                                total_skip_grown += 1
             except Exception as e:
                 print(f"[Neuroplastic] Skip growth error: {e}")
         
-        if prune:
-            # Prune weak skip connections
-            prune_ratio = 0.1 * strength  # 10% -> 1% as training progresses
-            try:
-                self.model.prune_skip_connections(prune_ratio)
-            except Exception as e:
-                print(f"[Neuroplastic] Skip prune error: {e}")
+        if total_skip_pruned > 0 or total_skip_grown > 0:
+            print(f"  Skip connections: pruned {total_skip_pruned}, grew {total_skip_grown}")
         
     def step(self, loss: float = None, ib_loss: float = None):
         """Call after each optimizer step.
@@ -762,12 +843,7 @@ class NeuroplasticScheduler:
                 prune_candidates[name] = indices
                 total_to_prune += len(indices)
         
-        # Phase 2: Grow exactly the same amount (net-zero!)
-        total_to_grow = total_to_prune
-        
-        print(f"  Target: prune {total_to_prune}, grow {total_to_grow} (net-zero)")
-        
-        # Phase 3: Execute pruning
+        # Phase 2: Execute pruning (independent)
         actual_pruned = 0
         for name, indices in prune_candidates.items():
             mask = self.masks[name]
@@ -781,14 +857,11 @@ class NeuroplasticScheduler:
             weight.data[prune_mask] = 0
             actual_pruned += n_pruned
         
-        # Phase 4: Execute growth
+        # Phase 3: Execute growth (independent, based on growth_ratio)
         actual_grown = 0
-        remaining_to_grow = total_to_grow
+        growth_ratio = self.config['growth_ratio'] * scale
         
         for name in self.masks:
-            if remaining_to_grow <= 0:
-                break
-                
             mask = self.masks[name]
             weight = self.weights[name]
             initial = self.initial_counts[name]
@@ -801,11 +874,12 @@ class NeuroplasticScheduler:
             if space <= 0:
                 continue
             
-            # Proportional allocation
-            layer_grow = min(space, remaining_to_grow * current // max(actual_pruned, 1))
-            layer_grow = max(1, layer_grow)  # At least 1
+            # Independent growth amount
+            n_grow = min(int(current * growth_ratio), space)
+            if n_grow <= 0:
+                continue
             
-            indices = self.hebbian_tracker.get_growth_candidates(name, mask, layer_grow)
+            indices = self.hebbian_tracker.get_growth_candidates(name, mask, n_grow)
             if len(indices) == 0:
                 continue
             
@@ -820,18 +894,21 @@ class NeuroplasticScheduler:
                 std = 0.1 / math.sqrt(max(avg_fan_in, 1))
                 weight.data[grow_mask] = torch.randn(n_grown, device=weight.device) * std
                 actual_grown += n_grown
-                remaining_to_grow -= n_grown
+        
+        print(f"  Result: pruned {actual_pruned}, grew {actual_grown} (independent)")
         
         # Update counters
         if actual_pruned > 0:
             self.prune_count += 1
         if actual_grown > 0:
             self.growth_count += 1
-            
-        print(f"  Result: pruned {actual_pruned}, grew {actual_grown}")
         
-        # Cross-layer skip updates
-        self._manage_cross_layer_skip(prune=True, grow=True)
+        # Cross-layer skip updates (unified with main network using same scale)
+        self._manage_cross_layer_skip(scale=scale, prune=True, grow=True)
+        
+        # RigL-style cleanup: reset momentum and apply gradient masking
+        self.reset_momentum()
+        self.apply_mask_to_gradients()
         
         # Reset trackers for next cycle
         self.hebbian_tracker.reset()
